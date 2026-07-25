@@ -82,6 +82,10 @@ h1 {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+#video.mirrored,
+#overlay.mirrored {
   transform: scaleX(-1);
 }
 
@@ -505,8 +509,13 @@ input[type="range"] {
 
         <div class="controls-row">
           <button id="toggleMakeup" class="action-btn">👁️ Ocultar maquillaje</button>
+          <button id="uploadPhoto" class="action-btn">🖼️ Subir foto</button>
+          <button id="useCamera" class="action-btn">📷 Usar camara</button>
+          <button id="toggleLandmarks" class="action-btn">🔎 Puntos IA: Off</button>
+          <button id="toggleTechMap" class="action-btn">🧭 Mapa tecnico: Off</button>
           <button id="applyReferenceLook" class="action-btn">🎯 Look objetivo</button>
           <button id="downloadPhoto" class="action-btn primary">📥 Descargar foto</button>
+          <input id="photoInput" type="file" accept="image/*" hidden />
         </div>
 
         <div class="status" id="status">Inicializando modelo de IA...</div>
@@ -556,6 +565,11 @@ input[type="range"] {
       const ctx = canvas.getContext("2d");
       const statusEl = document.getElementById("status");
       const toggleMakeupEl = document.getElementById("toggleMakeup");
+      const uploadPhotoEl = document.getElementById("uploadPhoto");
+      const useCameraEl = document.getElementById("useCamera");
+      const photoInputEl = document.getElementById("photoInput");
+      const toggleLandmarksEl = document.getElementById("toggleLandmarks");
+      const toggleTechMapEl = document.getElementById("toggleTechMap");
       const applyReferenceLookEl = document.getElementById("applyReferenceLook");
       const downloadPhotoEl = document.getElementById("downloadPhoto");
       const faceShapeLabelEl = document.getElementById("faceShapeLabel");
@@ -577,7 +591,8 @@ input[type="range"] {
           { name: "Rosa Coral", hex: "#ff8fa3" },
           { name: "Rosa Polvo", hex: "#e8b4c1" },
           { name: "Durazno", hex: "#f5a580" },
-          { name: "Frambuesa", hex: "#c75a7c" }
+          { name: "Frambuesa", hex: "#c75a7c" },
+          { name: "Rojo", hex: "#c61a3a" }
         ],
         contour: [
           { name: "Canela", hex: "#8b6f47" },
@@ -608,6 +623,12 @@ input[type="range"] {
       let showMakeup = true;
       let stableShapeCandidate = "indefinido";
       let stableShapeFrames = 0;
+      let sourceMode = "camera";
+      let uploadedImage = null;
+      let cameraStream = null;
+      let landmarkerMode = "VIDEO";
+      let debugViewMode = "off";
+      let techMapMode = "off";
 
       const makeupState = {
         lips: { color: "#c61a3a", opacity: 0.46 },
@@ -620,13 +641,19 @@ input[type="range"] {
       // Puntos faciales
       const OUTER_LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185];
       const INNER_MOUTH = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191];
-      const BLUSH_POINTS = [117, 346];
+      const BLUSH_POINTS = [117,234, 346];
       const CONTOUR_POINTS = [234, 454, 172, 397, 10, 152];
       const HIGHLIGHT_POINTS = [168, 6, 4, 151];
       const LEFT_EYE_UPPER = [33, 160, 159, 158, 157, 173, 133];
       const RIGHT_EYE_UPPER = [362, 385, 386, 387, 388, 466, 263];
+      const LEFT_EYE_SHADOW = [33, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7];
+      const RIGHT_EYE_SHADOW = [362, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382];
       const LEFT_BROW = [70, 63, 105, 66, 107];
       const RIGHT_BROW = [336, 296, 334, 293, 300];
+      const NOSE_BRIDGE = [6, 197, 195, 5, 4, 1, 19, 94];
+      const LEFT_CHEEK_CONTOUR = [234, 93, 132, 58, 172];
+      const RIGHT_CHEEK_CONTOUR = [454, 323, 361, 288, 397];
+      const FOREHEAD_CONTOUR = [10, 67, 109, 338, 297];
 
       const FACE_SHAPE_TIPS = {
         ovalado: {
@@ -677,6 +704,17 @@ input[type="range"] {
         canvas.height = video.videoHeight;
       }
 
+      function resizeCanvasToImage(image) {
+        if (!image?.naturalWidth || !image?.naturalHeight) return;
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+      }
+
+      function setMirror(enabled) {
+        video.classList.toggle("mirrored", enabled);
+        canvas.classList.toggle("mirrored", enabled);
+      }
+
       function drawFilledPath(landmarks, indices) {
         if (!indices.length) return;
         const first = landmarks[indices[0]];
@@ -693,6 +731,22 @@ input[type="range"] {
 
         ctx.closePath();
         ctx.fill();
+      }
+
+      function drawStrokePath(landmarks, indices, closePath = false) {
+        if (!indices.length) return;
+        const first = landmarks[indices[0]];
+        if (!first) return;
+
+        ctx.beginPath();
+        ctx.moveTo(first.x * canvas.width, first.y * canvas.height);
+        for (let i = 1; i < indices.length; i += 1) {
+          const p = landmarks[indices[i]];
+          if (!p) continue;
+          ctx.lineTo(p.x * canvas.width, p.y * canvas.height);
+        }
+        if (closePath) ctx.closePath();
+        ctx.stroke();
       }
 
       function hexToRgba(hex, alpha) {
@@ -737,22 +791,29 @@ input[type="range"] {
         ctx.globalAlpha = Math.min(0.48, makeupState.blush.opacity * modeFactor);
 
         const faceWidthPx = distance(landmarks[234], landmarks[454]) * canvas.width || canvas.width * 0.34;
-        const radius = faceWidthPx * 0.18;
+        const radius = faceWidthPx * 0.16;
 
-        for (const id of BLUSH_POINTS) {
+        for (let i = 0; i < BLUSH_POINTS.length; i += 1) {
+          const id = BLUSH_POINTS[i];
           const p = landmarks[id];
           if (!p) continue;
+
+          const anchor = landmarks[i === 0 ? 234 : 454];
+          if (!anchor) continue;
           const x = p.x * canvas.width;
           const y = p.y * canvas.height;
+          const ax = anchor.x * canvas.width;
+          const ay = anchor.y * canvas.height;
+          const angle = Math.atan2(ay - y, ax - x);
 
           const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-          gradient.addColorStop(0, hexToRgba(makeupState.blush.color, 0.68));
-          gradient.addColorStop(0.55, hexToRgba(makeupState.blush.color, 0.3));
+          gradient.addColorStop(0, hexToRgba(makeupState.blush.color, 0.62));
+          gradient.addColorStop(0.58, hexToRgba(makeupState.blush.color, 0.26));
           gradient.addColorStop(1, "rgba(255,255,255,0)");
 
           ctx.fillStyle = gradient;
           ctx.beginPath();
-          ctx.ellipse(x, y, radius * 1.08, radius * 0.72, 0, 0, Math.PI * 2);
+          ctx.ellipse(x, y, radius * 1.18, radius * 0.62, angle * 0.35, 0, Math.PI * 2);
           ctx.fill();
         }
 
@@ -766,23 +827,29 @@ input[type="range"] {
         ctx.globalAlpha = Math.min(0.42, makeupState.contour.opacity * modeFactor);
 
         const faceWidthPx = distance(landmarks[234], landmarks[454]) * canvas.width || canvas.width * 0.34;
-        const radius = faceWidthPx * 0.16;
+        const radius = faceWidthPx * 0.13;
 
-        for (const id of CONTOUR_POINTS) {
-          const p = landmarks[id];
-          if (!p) continue;
-          const x = p.x * canvas.width;
-          const y = p.y * canvas.height;
+        const contourRegions = [LEFT_CHEEK_CONTOUR, RIGHT_CHEEK_CONTOUR, FOREHEAD_CONTOUR];
+        for (const region of contourRegions) {
+          const points = region.map(id => landmarks[id]).filter(Boolean);
+          if (points.length < 4) continue;
 
-          const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-          gradient.addColorStop(0, hexToRgba(makeupState.contour.color, 0.56));
-          gradient.addColorStop(0.6, hexToRgba(makeupState.contour.color, 0.18));
+          let cx = 0;
+          let cy = 0;
+          for (const p of points) {
+            cx += p.x;
+            cy += p.y;
+          }
+          cx = (cx / points.length) * canvas.width;
+          cy = (cy / points.length) * canvas.height;
+
+          const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+          gradient.addColorStop(0, hexToRgba(makeupState.contour.color, 0.52));
+          gradient.addColorStop(0.62, hexToRgba(makeupState.contour.color, 0.14));
           gradient.addColorStop(1, "rgba(0,0,0,0)");
 
           ctx.fillStyle = gradient;
-          ctx.beginPath();
-          ctx.ellipse(x, y, radius * 1.12, radius * 0.76, 0, 0, Math.PI * 2);
-          ctx.fill();
+          drawFilledPath(landmarks, region);
         }
 
         ctx.restore();
@@ -804,8 +871,8 @@ input[type="range"] {
           const y = p.y * canvas.height;
 
           const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius);
-          gradient.addColorStop(0, hexToRgba(makeupState.highlight.color, 0.6));
-          gradient.addColorStop(0.55, hexToRgba(makeupState.highlight.color, 0.22));
+          gradient.addColorStop(0, hexToRgba(makeupState.highlight.color, 0.48));
+          gradient.addColorStop(0.55, hexToRgba(makeupState.highlight.color, 0.14));
           gradient.addColorStop(1, "rgba(255,255,255,0)");
 
           ctx.fillStyle = gradient;
@@ -823,14 +890,15 @@ input[type="range"] {
         const faceWidthPx = distance(landmarks[234], landmarks[454]) * canvas.width || canvas.width * 0.34;
 
         const eyeSets = [
-          { upper: LEFT_EYE_UPPER, brow: LEFT_BROW },
-          { upper: RIGHT_EYE_UPPER, brow: RIGHT_BROW }
+          { upper: LEFT_EYE_UPPER, shadow: LEFT_EYE_SHADOW, brow: LEFT_BROW },
+          { upper: RIGHT_EYE_UPPER, shadow: RIGHT_EYE_SHADOW, brow: RIGHT_BROW }
         ];
 
         for (const eye of eyeSets) {
           const lidPoints = eye.upper.map(id => landmarks[id]).filter(Boolean);
+          const shadowPoints = eye.shadow.map(id => landmarks[id]).filter(Boolean);
           const browPoints = eye.brow.map(id => landmarks[id]).filter(Boolean);
-          if (lidPoints.length < 4 || browPoints.length < 3) continue;
+          if (lidPoints.length < 4 || shadowPoints.length < 6 || browPoints.length < 3) continue;
 
           let lidCx = 0;
           let lidCy = 0;
@@ -847,7 +915,7 @@ input[type="range"] {
 
           const lidLift = Math.max(canvas.height * 0.015, (lidCy - browCy) * 0.6);
           const radiusX = faceWidthPx * 0.085;
-          const radiusY = faceWidthPx * 0.05;
+          const radiusY = faceWidthPx * 0.045;
 
           ctx.save();
           ctx.globalCompositeOperation = "multiply";
@@ -865,8 +933,22 @@ input[type="range"] {
           smoke.addColorStop(1, "rgba(0,0,0,0)");
 
           ctx.fillStyle = smoke;
+          drawFilledPath(landmarks, eye.shadow);
+
+          ctx.globalAlpha = Math.min(0.2, baseAlpha * 0.62);
+          const smokeOuter = ctx.createRadialGradient(
+            lidCx,
+            lidCy - lidLift * 0.42,
+            radiusX * 0.15,
+            lidCx,
+            lidCy - lidLift * 0.42,
+            radiusX * 1.35
+          );
+          smokeOuter.addColorStop(0, hexToRgba(makeupState.eyes.color, 0.3));
+          smokeOuter.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = smokeOuter;
           ctx.beginPath();
-          ctx.ellipse(lidCx, lidCy - lidLift * 0.22, radiusX, radiusY, 0, 0, Math.PI * 2);
+          ctx.ellipse(lidCx, lidCy - lidLift * 0.3, radiusX * 1.1, radiusY * 0.9, 0, 0, Math.PI * 2);
           ctx.fill();
           ctx.restore();
 
@@ -886,6 +968,166 @@ input[type="range"] {
           ctx.stroke();
           ctx.restore();
         }
+      }
+
+      function drawDebugLandmarks(landmarks) {
+        if (debugViewMode === "off") return;
+
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+
+        ctx.fillStyle = "rgba(0, 220, 255, 0.88)";
+        for (let i = 0; i < landmarks.length; i += 1) {
+          const p = landmarks[i];
+          if (!p) continue;
+          const x = p.x * canvas.width;
+          const y = p.y * canvas.height;
+          ctx.beginPath();
+          ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.strokeStyle = "rgba(0, 160, 210, 0.7)";
+        ctx.lineWidth = 1.1;
+        drawStrokePath(landmarks, OUTER_LIPS, true);
+        drawStrokePath(landmarks, INNER_MOUTH, true);
+        drawStrokePath(landmarks, LEFT_EYE_UPPER, false);
+        drawStrokePath(landmarks, RIGHT_EYE_UPPER, false);
+        drawStrokePath(landmarks, LEFT_BROW, false);
+        drawStrokePath(landmarks, RIGHT_BROW, false);
+        drawStrokePath(landmarks, NOSE_BRIDGE, false);
+
+        if (debugViewMode === "numbers") {
+          const keySet = new Set([
+            ...OUTER_LIPS,
+            ...INNER_MOUTH,
+            ...LEFT_EYE_UPPER,
+            ...RIGHT_EYE_UPPER,
+            ...LEFT_BROW,
+            ...RIGHT_BROW,
+            ...NOSE_BRIDGE,
+            ...BLUSH_POINTS,
+            ...CONTOUR_POINTS,
+            ...HIGHLIGHT_POINTS
+          ]);
+
+          ctx.fillStyle = "rgba(20, 20, 20, 0.9)";
+          ctx.font = "10px Sora, sans-serif";
+          for (let i = 0; i < landmarks.length; i += 1) {
+            if (!keySet.has(i) && i % 18 !== 0) continue;
+            const p = landmarks[i];
+            if (!p) continue;
+            const x = p.x * canvas.width + 3;
+            const y = p.y * canvas.height - 3;
+            ctx.fillText(String(i), x, y);
+          }
+        }
+
+        ctx.restore();
+      }
+
+      function drawTechnicalMap(landmarks) {
+        if (techMapMode === "off") return;
+
+        const groupsByMode = {
+          lips: [
+            { name: "OUTER_LIPS", indices: OUTER_LIPS, color: "rgba(196, 26, 58, 0.95)", closed: true },
+            { name: "INNER_MOUTH", indices: INNER_MOUTH, color: "rgba(46, 176, 86, 0.95)", closed: true }
+          ],
+          blush: [
+            { name: "BLUSH_POINTS", indices: BLUSH_POINTS, color: "rgba(213, 62, 255, 0.95)", closed: false }
+          ],
+          contour: [
+            { name: "LEFT_CHEEK_CONTOUR", indices: LEFT_CHEEK_CONTOUR, color: "rgba(64, 64, 64, 0.95)", closed: true },
+            { name: "RIGHT_CHEEK_CONTOUR", indices: RIGHT_CHEEK_CONTOUR, color: "rgba(64, 64, 64, 0.95)", closed: true },
+            { name: "FOREHEAD_CONTOUR", indices: FOREHEAD_CONTOUR, color: "rgba(64, 64, 64, 0.95)", closed: true }
+          ],
+          highlight: [
+            { name: "HIGHLIGHT_POINTS", indices: HIGHLIGHT_POINTS, color: "rgba(235, 203, 78, 0.95)", closed: false }
+          ],
+          eyes: [
+            { name: "LEFT_EYE_UPPER", indices: LEFT_EYE_UPPER, color: "rgba(127, 60, 182, 0.95)", closed: false },
+            { name: "RIGHT_EYE_UPPER", indices: RIGHT_EYE_UPPER, color: "rgba(184, 131, 39, 0.95)", closed: false },
+            { name: "LEFT_EYE_SHADOW", indices: LEFT_EYE_SHADOW, color: "rgba(127, 60, 182, 0.85)", closed: true },
+            { name: "RIGHT_EYE_SHADOW", indices: RIGHT_EYE_SHADOW, color: "rgba(184, 131, 39, 0.85)", closed: true },
+            { name: "LEFT_BROW", indices: LEFT_BROW, color: "rgba(31, 68, 124, 0.95)", closed: false },
+            { name: "RIGHT_BROW", indices: RIGHT_BROW, color: "rgba(31, 68, 124, 0.95)", closed: false }
+          ]
+        };
+
+        let groups = [];
+        if (techMapMode === "all") {
+          groups = [
+            ...groupsByMode.lips,
+            ...groupsByMode.blush,
+            ...groupsByMode.contour,
+            ...groupsByMode.highlight,
+            ...groupsByMode.eyes
+          ];
+        } else {
+          groups = groupsByMode[techMapMode] || [];
+        }
+
+        ctx.save();
+        ctx.globalCompositeOperation = "source-over";
+        ctx.font = "11px Sora, sans-serif";
+        ctx.lineWidth = 1.4;
+
+        for (const group of groups) {
+          const points = group.indices.map(i => ({ i, p: landmarks[i] })).filter(item => Boolean(item.p));
+          if (points.length === 0) continue;
+
+          ctx.strokeStyle = group.color;
+          ctx.fillStyle = group.color;
+
+          drawStrokePath(landmarks, group.indices, group.closed);
+
+          for (const item of points) {
+            const x = item.p.x * canvas.width;
+            const y = item.p.y * canvas.height;
+            ctx.beginPath();
+            ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillText(String(item.i), x + 4, y - 4);
+          }
+
+          const anchor = points[0].p;
+          if (anchor) {
+            ctx.fillText(group.name, anchor.x * canvas.width + 8, anchor.y * canvas.height - 10);
+          }
+        }
+
+        ctx.restore();
+      }
+
+      function cycleDebugMode() {
+        if (debugViewMode === "off") debugViewMode = "points";
+        else if (debugViewMode === "points") debugViewMode = "numbers";
+        else debugViewMode = "off";
+
+        const labels = {
+          off: "🔎 Puntos IA: Off",
+          points: "🔎 Puntos IA: On",
+          numbers: "🔢 Puntos IA + Nros"
+        };
+        toggleLandmarksEl.textContent = labels[debugViewMode];
+      }
+
+      function cycleTechMapMode() {
+        const modes = ["off", "lips", "blush", "contour", "highlight", "eyes", "all"];
+        const idx = modes.indexOf(techMapMode);
+        techMapMode = modes[(idx + 1) % modes.length];
+
+        const labels = {
+          off: "🧭 Mapa tecnico: Off",
+          lips: "🧭 Mapa: Labios",
+          blush: "🧭 Mapa: Rubor",
+          contour: "🧭 Mapa: Contorno",
+          highlight: "🧭 Mapa: Iluminador",
+          eyes: "🧭 Mapa: Ojos",
+          all: "🧭 Mapa: Todo"
+        };
+        toggleTechMapEl.textContent = labels[techMapMode];
       }
 
       function distance(a, b) {
@@ -937,7 +1179,7 @@ input[type="range"] {
       function renderLoop() {
         if (!running) return;
 
-        if (video.readyState >= 2) {
+        if (sourceMode === "camera" && video.readyState >= 2) {
           resizeCanvasToVideo();
           ctx.clearRect(0, 0, canvas.width, canvas.height);
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -962,6 +1204,30 @@ input[type="range"] {
             drawContour(latestLipLandmarks);
             drawHighlight(latestLipLandmarks);
           }
+
+          if (latestLipLandmarks) {
+            drawDebugLandmarks(latestLipLandmarks);
+            drawTechnicalMap(latestLipLandmarks);
+          }
+        }
+
+        if (sourceMode === "photo" && uploadedImage) {
+          resizeCanvasToImage(uploadedImage);
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(uploadedImage, 0, 0, canvas.width, canvas.height);
+
+          if (latestLipLandmarks && showMakeup) {
+            drawEyes(latestLipLandmarks);
+            drawLipstick(latestLipLandmarks);
+            drawBlush(latestLipLandmarks);
+            drawContour(latestLipLandmarks);
+            drawHighlight(latestLipLandmarks);
+          }
+
+          if (latestLipLandmarks) {
+            drawDebugLandmarks(latestLipLandmarks);
+            drawTechnicalMap(latestLipLandmarks);
+          }
         }
 
         requestAnimationFrame(renderLoop);
@@ -978,6 +1244,7 @@ input[type="range"] {
             audio: false
           });
 
+          cameraStream = stream;
           video.srcObject = stream;
           await video.play();
         } catch (error) {
@@ -985,6 +1252,72 @@ input[type="range"] {
           setStatus("No se pudo acceder a la camara. Verifica permisos del navegador.", true);
           throw error;
         }
+      }
+
+      async function ensureLandmarkerMode(mode) {
+        if (landmarkerMode === mode) return;
+        await faceLandmarker.setOptions({ runningMode: mode });
+        landmarkerMode = mode;
+      }
+
+      function stopCameraStream() {
+        if (!cameraStream) return;
+        cameraStream.getTracks().forEach(track => track.stop());
+        cameraStream = null;
+        video.srcObject = null;
+      }
+
+      async function handlePhotoUpload(file) {
+        if (!file) return;
+
+        const objectUrl = URL.createObjectURL(file);
+        try {
+          const image = await new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = objectUrl;
+          });
+
+          uploadedImage = image;
+          sourceMode = "photo";
+          setMirror(false);
+          stopCameraStream();
+
+          await ensureLandmarkerMode("IMAGE");
+          const result = faceLandmarker.detect(uploadedImage);
+
+          if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+            latestLipLandmarks = result.faceLandmarks[0];
+            updateFaceShapeStable(inferFaceShape(latestLipLandmarks));
+            setStatus("Foto cargada. Ajusta maquillaje o usa Look objetivo.");
+          } else {
+            latestLipLandmarks = null;
+            updateFaceShapeStable("indefinido");
+            setStatus("No se detecto rostro en la foto. Prueba otra imagen frontal.", true);
+          }
+        } catch (error) {
+          console.error(error);
+          setStatus("No se pudo procesar la foto. Intenta con otra imagen.", true);
+        } finally {
+          URL.revokeObjectURL(objectUrl);
+          photoInputEl.value = "";
+        }
+      }
+
+      async function useCameraSource() {
+        sourceMode = "camera";
+        uploadedImage = null;
+        latestLipLandmarks = null;
+        setMirror(true);
+
+        await ensureLandmarkerMode("VIDEO");
+
+        if (!cameraStream) {
+          await initCamera();
+        }
+
+        setStatus("Camara activa. Selecciona colores y ajusta opacidad.");
       }
 
       async function initModel() {
@@ -1102,6 +1435,27 @@ input[type="range"] {
           toggleMakeupEl.textContent = showMakeup ? "👁️ Ocultar maquillaje" : "👁️ Mostrar maquillaje";
         });
 
+        uploadPhotoEl.addEventListener("click", () => {
+          photoInputEl.click();
+        });
+
+        photoInputEl.addEventListener("change", async event => {
+          const file = event.target.files?.[0];
+          await handlePhotoUpload(file);
+        });
+
+        useCameraEl.addEventListener("click", async () => {
+          try {
+            await useCameraSource();
+          } catch (error) {
+            console.error(error);
+            setStatus("No fue posible activar la camara. Puedes usar Subir foto.", true);
+          }
+        });
+
+        toggleLandmarksEl.addEventListener("click", cycleDebugMode);
+        toggleTechMapEl.addEventListener("click", cycleTechMapMode);
+
         applyReferenceLookEl.addEventListener("click", applyReferenceLook);
 
         downloadPhotoEl.addEventListener("click", downloadScreenshot);
@@ -1128,24 +1482,27 @@ input[type="range"] {
       }
 
       async function bootstrap() {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          setStatus("Tu navegador no soporta getUserMedia para usar la camara.", true);
-          return;
-        }
-
         createColorSwatches();
         bindTabs();
         bindOpacityControls();
         bindActionButtons();
+        setMirror(true);
 
         try {
           setStatus("Cargando modelo de IA...");
           await initModel();
-          setStatus("Solicitando acceso a camara...");
-          await initCamera();
+          if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            setStatus("Solicitando acceso a camara...");
+            await initCamera();
+            sourceMode = "camera";
+            setStatus("Listo. Puedes usar camara o subir una foto.");
+          } else {
+            sourceMode = "photo";
+            setMirror(false);
+            setStatus("Tu navegador no soporta camara. Usa Subir foto.", true);
+          }
 
           running = true;
-          setStatus("Listo. Selecciona colores y ajusta opacidad.");
           requestAnimationFrame(renderLoop);
         } catch {
           running = false;
